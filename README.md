@@ -77,7 +77,8 @@ mod tests {
 }
 ```
 
-类似地，针对bitmap、slab、tlsf算法也编写了对应算法特性的测例,详情可见https://github.com/numpy1314/allocator/tree/main/doc，在文档中详细讲解了算法的具体实现过程，
+类似地，针对bitmap、slab、tlsf算法也编写了对应算法特性的测例,详情可见https://github.com/numpy1314/allocator/tree/main/doc   
+在文档中详细讲解了算法的具体实现过程，
 
 针对页级别的分配算法bitmap分别写了单页分配和多页分配的测试；
 
