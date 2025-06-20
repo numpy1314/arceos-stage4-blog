@@ -88,5 +88,165 @@ mod tests {
 针对tlsf算法优化碎片管理的特性，循环一百次分配不同大小的内存块，然后释放特定条件的块，主动创造大量小块空闲空间，再尝试能否成功分配超出单个空闲块尺寸的大内存请求
 ![](pic/test-tlsf.png)
 
-### 第三周
-第三周的工作主要是和郑植陈宏同学一起完成arceos的下游仓库合并工作，主要是将arceos的下游仓库中的代码合并到arceos主仓库中，这一过程中由于我对
+### 第三、四周
+第三、四周的工作主要是和郑植陈宏同学一起完成arceos的下游仓库合并工作，主要是将arceos的下游仓库中的代码合并到arceos主仓库中，这一过程中由于我对git的使用不够熟练，遇到了不少问题，感谢郑植陈宏同学的耐心指导和帮助，也感谢柏乔森工程师在过程中的指导，让我对lwext4文件系统的简单实现有了一个初步的了解,下面是简单的介绍。
+
+文件系统是一个相对庞大的工程，因此本次简单的支持lwext4文件系统的读写功能的pr还是基于已有的lwext4的c库对其进行封装利用，lwext4-rust链接https://github.com/Josen-B/lwext4_rust
+
+![](pic/lwext4-rust.png)
+
+其中binding.rs是由bindgen工具自动生成的C语言绑定文件，包含了从C头文件转换来的Rust函数声明、结构体定义和常量
+
+blockdev.rs是块设备操作实现部分，其中定义了操作系统需要实现的磁盘操作接口；KernelDevOp trait，实现了与具体操作系统的解耦；定义了Ext4BlockWrapper结构体，封装了ext4块设备的所有操作，包括挂载、卸载、读写等功能；也实现了供C调用的回调函数，如设备打开、读取、写入
+
+file.rs是文件操作接口的具体实现，包含Ext4File结构体，提供文件的创建、读写、定位等操作。与块设备操作解耦，专注于文件级别的操作
+
+而后就是在arceos上对ext4的核心支持https://github.com/numpy1314/arceos/blob/test/modules/axfs/src/fs/ext4fs.rs
+
+首先对文件系统进行初始化，接收磁盘设备作为输入，初始化 EXT4 文件系统包装器（Ext4BlockWrapper），创建根目录节点（FileWrapper类型），最后返回完整的文件系统实例
+```rust
+impl Ext4FileSystem {
+    #[cfg(feature = "use-ramdisk")]
+    pub fn new(mut disk: Disk) -> Self {
+        unimplemented!()
+    }
+
+    #[cfg(not(feature = "use-ramdisk"))]
+    pub fn new(disk: Disk) -> Self {
+        info!("获取磁盘信息 大小: {}, 位置: {}", disk.size(), disk.position());
+        // 初始化 EXT4 文件系统包装器
+        let inner = Ext4BlockWrapper::<Disk>::new(disk).expect("初始化 EXT4 文件系统失败");
+        // 创建根目录节点
+        let root = Arc::new(FileWrapper::new("/", InodeTypes::EXT4_DE_DIR));
+        Self { inner, root }
+    }
+}
+```
+涉及路径处理的部分
+```rust
+/// 路径规范化处理逻辑
+/// 用于处理相对路径，将其转换为绝对路径。它会处理多余的斜杠、当前目录（.）等，并相对于当前节点的路径构建完整路径
+fn path_deal_with(&self, path: &str) -> String {
+    let trim_path = path.trim_matches('/');
+    if trim_path.is_empty() || trim_path == "." {
+        return String::new();
+    }
+
+    let mut result = if let Some(rest) = trim_path.strip_prefix("./") {
+        rest
+    } else {
+        trim_path
+    }
+    .replace("//", "/");
+
+    if trim_path != result {
+        return self.path_deal_with(&result);
+    }
+
+    let file = self.0.lock();
+    let base_path = file.get_path().to_str().unwrap().trim_end_matches('/');
+    let fpath = format!("{}/{}", base_path, trim_path);
+    debug!("生成完整路径: {}", fpath);
+    fpath
+}
+```
+​​文件操作​​:
+
+- get_attr：获取文件属性（权限、类型、大小等）。如果是文件，它会打开文件获取大小，然后关闭。
+- create：创建文件或目录。根据传入的节点类型创建相应的 inode。
+- remove：删除文件或目录（如果是目录则调用 dir_rm，文件则调用 file_remove）。
+- parent：获取父目录的节点引用。通过解析当前路径获取父目录路径，然后创建一个新的 FileWrapper 节点。
+- read_dir：读取目录内容，将目录项填充到 dirents 数组中，返回实际读取的条目数。
+- lookup：查找给定路径的节点，可以是文件或目录。
+- read_at 和 write_at：在指定位置读写文件内容
+- truncate：截断文件到指定大小。
+- rename：重命名文件或目录。
+
+这部分内容较长，具体实现在ext4fs.rs中90-289行
+
+​​磁盘操作​​:
+
+- 由于Disk 类型实现了 KernelDevOp trait，因此提供了块设备的基本操作（读、写、刷新、定位）。
+- read 和 write 方法通过循环调用设备的 read_one 和 write_one 方法，确保读取或写入整个缓冲区。
+- seek 方法根据 whence 参数（SEEK_SET、SEEK_CUR、SEEK_END）计算新的位置。
+```rust
+impl KernelDevOp for Disk {
+    type DevType = Disk;
+
+    fn read(dev: &mut Disk, mut buf: &mut [u8]) -> Result<usize, i32> {
+        trace!("READ block device buf={}", buf.len());
+        let mut read_len = 0;
+        while !buf.is_empty() {
+            match dev.read_one(buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    read_len += n;
+                }
+                Err(_) => return Err(DevError::Io as i32),
+            }
+        }
+        trace!("READ rt len={}", read_len);
+        Ok(read_len)
+    }
+
+    fn write(dev: &mut Self::DevType, mut buf: &[u8]) -> Result<usize, i32> {
+        trace!("WRITE block device buf={}", buf.len());
+        let mut write_len = 0;
+        while !buf.is_empty() {
+            match dev.write_one(buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf = &buf[n..];
+                    write_len += n;
+                }
+                Err(_) => return Err(DevError::Io as i32),
+            }
+        }
+        trace!("WRITE rt len={}", write_len);
+        Ok(write_len)
+    }
+
+    fn flush(_dev: &mut Self::DevType) -> Result<usize, i32> {
+        debug!("uncomplicated");
+        Ok(0)
+    }
+
+    fn seek(dev: &mut Disk, off: i64, whence: i32) -> Result<i64, i32> {
+        let size = dev.size();
+        let pos = dev.position();
+        trace!(
+            "SEEK block device size:{}, pos:{}, offset={}, whence={}",
+            size, pos, off, whence
+        );
+
+        let new_pos = match whence as u32 {
+            SEEK_SET => off,
+            SEEK_CUR => pos as i64 + off,
+            SEEK_END => size as i64 + off,
+            _ => {
+                error!("invalid seek() whence: {}", whence);
+                return Err(DevError::Io as i32);
+            }
+        };
+
+        if new_pos < 0 {
+            warn!("Negative seek position");
+            return Err(DevError::Io as i32);
+        }
+
+        if new_pos as u64 > size {
+            warn!("Seek position is beyond device size");
+        }
+        dev.seek_position(new_pos as u64);
+        Ok(new_pos)
+    }
+}
+```
+目前整个文件系统还有很多需要修改的地方待完成,包括读写性能不够理想，但基本的文件系统功能已能支持
+
+除此之外还有一个文件系统相关的pr已合并 https://github.com/arceos-org/arceos/pull/260
+
+主要修改是将将原sys_write中的写作逻辑拆解为新的函数write_impl，以提高代码的复用性。同时，会显式检查 buf null 指针以避免未定义的行为
+
+![](pic/pr260.png)
